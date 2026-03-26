@@ -1,79 +1,103 @@
-# SageProxy Backend
+# SageProxy
 
-SageProxy Backend 是一个基于 FastAPI 构建的中间层服务。它的核心职责是安全地代理外部用户的计算请求，并将其转化为 AWS SageMaker Training Jobs，从而实现 GPU 资源的按需调度与自动释放。
+单体仓库（Monorepo）：**FastAPI 后端**（`backend/`）、**Vite + React + Tailwind 控制台**（`frontend/`）、**SageCLI**（`cli/`）。生产环境可先 `npm run build`，再由 FastAPI 托管 `frontend/dist`，实现**单端口**全栈访问。
 
-## 架构总览
+## 目录结构
 
-| 类别 | 说明 |
-|------|------|
-| 框架 | FastAPI (Python 3.10+) |
-| 云服务 | AWS SageMaker（计算）、Amazon S3（存储） |
-| 核心依赖 | `boto3`、`uvicorn`、`pydantic`、`python-dotenv` |
-
-## 本地开发与运行
-
-### 1. 环境准备
-
-确保本地已配置具备相应权限的 AWS 凭证：
-
-```bash
-aws configure
+```
+gpu-dispatcher-api/
+├── backend/main.py       # FastAPI（uvicorn: backend.main:app）
+├── frontend/             # Vite + React + Tailwind（赛博朋克风双视角 UI）
+├── cli/                  # sagecli 命令行
+├── pyproject.toml        # Python 依赖（uv sync）
+└── README.md
 ```
 
-### 2. 安装依赖（推荐 uv）
+Python 依赖统一在**仓库根目录** `pyproject.toml` 管理（白皮书中的 `backend/pyproject.toml` 如需可后续再拆分为 uv workspace）。
 
-[uv](https://docs.astral.sh/uv/) 会在项目根目录创建 `.venv` 并安装 `pyproject.toml` 中的依赖：
+## 云端配置（管理员）
 
-```bash
-uv venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-uv sync
-```
+浏览器将代码包 **PUT 到 S3 预签名 URL** 时，必须在 **S3 桶「权限 → CORS」** 中允许浏览器源与 `PUT`（具体 JSON 以你们桶策略为准；开发阶段可用 `AllowedOrigins: ["*"]` 等，生产收紧）。
 
-若未安装 uv，可先 `curl -LsSf https://astral.sh/uv/install.sh | sh`，或使用 `pip install uv`。
+## 环境变量（后端）
 
-### 3. 环境变量
-
-复制示例文件并编辑（勿将真实密钥提交到 Git）：
+可将 `.env` 放在**仓库根目录**或 **`backend/.env`**（二者都会被加载，后者优先覆盖同名键）。
 
 ```bash
 cp .env.example .env
 ```
 
-`.env` 中至少需要配置：
+至少需要：`AWS_REGION`、`SAGEMAKER_ROLE_ARN`、`S3_BUCKET_NAME`；可选访问密钥、`CORS_ORIGINS` 等。说明见 `.env.example`。
 
-```env
-AWS_REGION=eu-north-1
-SAGEMAKER_ROLE_ARN=arn:aws:iam::YOUR_ACCOUNT_ID:role/YourSageMakerRole
-S3_BUCKET_NAME=your-s3-bucket-name
-```
+**CORS**：`CORS_ORIGINS=*` 时与 `allow_credentials=False` 搭配（符合 Starlette 限制）。若前端需带 Cookie，请设为逗号分隔的具体源（如 `http://localhost:5173`）。
 
-若在本地用 **访问密钥**（或 STS 临时凭证）调用 AWS API，可同时配置：
+## 安装与运行
 
-```env
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-# 临时凭证时需要
-# AWS_SESSION_TOKEN=...
-```
-
-未配置密钥时仍可使用本机默认凭证链（例如已 `aws configure` 的配置文件、工作负载身份等）。
-
-### 4. 启动服务
+### Python（后端 + CLI）
 
 ```bash
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+uv venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+uv sync
 ```
 
-启动后访问 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) 查看 Swagger 文档并调试接口。
+### 前端
 
-## 安全与计费准则
+```bash
+cd frontend && npm install
+```
 
-- **硬性超时**：所有 SageMaker 任务必须设置 `MaxRuntimeInSeconds`，避免僵尸任务持续计费。
-- **实例限制**：默认仅允许调度高性价比实例（如 `ml.g4dn.xlarge`）。
+**开发（前后端分离、热更新）**
 
-## TODO
+- 终端 1：`uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000`
+- 终端 2：`cd frontend && npm run dev`（默认 [http://localhost:5173](http://localhost:5173)）
 
-- [ ] 接入数据库（DynamoDB / RDS）进行 API Key 鉴权
-- [ ] 实现额度 / 余额扣减逻辑
-- [ ] 完善 S3 Presigned URL 上传与下载接口
+`frontend/.env.development` 中默认 `VITE_API_BASE=http://127.0.0.1:8000`，供 Axios 调用 API。
+
+**生产（单端口：API + 静态页）**
+
+```bash
+cd frontend && npm run build
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
+```
+
+若存在 `frontend/dist`，FastAPI 会挂载到 `/`，与 `/docs`、`/admin/*` 等 API 共存；浏览器访问 `http://<host>:8000/` 即控制台。
+
+### SageCLI
+
+```bash
+sagecli config
+sagecli submit -u <user> -p <prefix>
+sagecli status <job_name>
+```
+
+## API 摘要
+
+| 用途 | 方法 | 路径 |
+|------|------|------|
+| 预签名上传 | POST | `/generate-upload-url` |
+| 提交训练 | POST | `/submit-job` |
+| 任务状态 | GET | `/job-status/{job_name}` |
+| 停止任务 | POST | `/stop-job/{job_name}` |
+| 管理大盘 | GET | `/admin/stats`（见下） |
+
+`GET /admin/stats` 返回字段包括：`active_count`（进行中作业数）、`total_training_instances`（池内训练实例节点数加总）、`total_gpu_units`（按实例类型映射的 GPU 张数估算）、`jobs_created_today_utc`、`jobs`（含 `instance_type`、`instance_count`、`gpu_units`）、`resource_note`（估算说明）、`as_of_utc`。
+
+Swagger：[http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+## 控制台功能（前端）
+
+- **开发者终端**：说明「页面用途 → 上传什么 → 目录示例 → 打包命令」，再提供 `.tar.gz` 上传；链路为预签名 → 浏览器直传 S3 → `submit-job`。入口脚本须为 `train.py`（与后端 SageMaker 环境变量一致）。
+- **资源与运维**：展示池中 **GPU 估算张数**、**训练节点数**、进行中任务数、UTC 当日新建任务数；表格含实例类型、节点数、GPU(估)、已运行时长；可停止任务。每 10 秒刷新。GPU 由后端按常见实例规格映射，未收录类型有保守启发式，**以 AWS 账单为准**。
+
+模拟用户由 `VITE_CURRENT_USER` 控制（默认见 `frontend/.env.development`）。
+
+## 安全说明
+
+- 训练任务在服务端设置 `MaxRuntimeInSeconds`。
+- **管理接口与控制台当前无登录鉴权**，仅适合内网或受信环境；生产需 HTTPS、认证与最小权限 IAM。
+
+## 后续可做
+
+- [ ] API Key / 登录  
+- [ ] 额度与扣费  
+- [ ] 任务与账单落库统计  

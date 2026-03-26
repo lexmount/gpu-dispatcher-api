@@ -1,14 +1,41 @@
 import os
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import boto3
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-load_dotenv()
+_backend_dir = Path(__file__).resolve().parent
+_repo_root = _backend_dir.parent
+load_dotenv(_backend_dir / ".env")
+load_dotenv(_repo_root / ".env")
 
-app = FastAPI(title="GPU Resource Scheduler API")
+app = FastAPI(title="SageProxy API")
+
+# CORS：浏览器直传 S3 不经过此处；此处供 Vite 开发机 (5173) 等访问 API。
+# allow_origins=* 时 Starlette 要求 allow_credentials=False；需带 Cookie 时请列出具体源。
+_cors_origins = os.getenv("CORS_ORIGINS", "*").strip()
+if _cors_origins == "*":
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[o.strip() for o in _cors_origins.split(",") if o.strip()],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # ================= AWS / SageMaker 配置（环境变量 + .env）=================
 
@@ -62,6 +89,134 @@ def _require_bucket() -> None:
             status_code=503,
             detail="服务未配置：请在环境变量或 .env 中设置 S3_BUCKET_NAME",
         )
+
+
+def _user_id_from_job_name(job_name: str) -> str:
+    """任务名格式 {prefix}-{user_id}-{unix_ts}，user_id 中不含 '-'。"""
+    parts = job_name.rsplit("-", 2)
+    if len(parts) == 3 and parts[2].isdigit():
+        return parts[1]
+    return "—"
+
+
+def _list_in_progress_jobs() -> list[dict]:
+    out: list[dict] = []
+    token: str | None = None
+    while True:
+        kwargs: dict = {
+            "StatusEquals": "InProgress",
+            "SortBy": "CreationTime",
+            "SortOrder": "Descending",
+            "MaxResults": 100,
+        }
+        if token:
+            kwargs["NextToken"] = token
+        resp = sm_client.list_training_jobs(**kwargs)
+        for j in resp.get("TrainingJobSummaries", []):
+            name = j["TrainingJobName"]
+            ct = j["CreationTime"]
+            out.append(
+                {
+                    "job_name": name,
+                    "creation_time": ct.isoformat(),
+                    "status": j.get("TrainingJobStatus", "InProgress"),
+                    "user_id": _user_id_from_job_name(name),
+                }
+            )
+        token = resp.get("NextToken")
+        if not token:
+            break
+    return out
+
+
+def _count_jobs_created_since(since: datetime) -> int:
+    total = 0
+    token: str | None = None
+    while True:
+        kwargs: dict = {
+            "CreationTimeAfter": since,
+            "SortBy": "CreationTime",
+            "SortOrder": "Descending",
+            "MaxResults": 100,
+        }
+        if token:
+            kwargs["NextToken"] = token
+        resp = sm_client.list_training_jobs(**kwargs)
+        total += len(resp.get("TrainingJobSummaries", []))
+        token = resp.get("NextToken")
+        if not token:
+            break
+    return total
+
+
+# 常见 SageMaker 训练实例：单节点 GPU 数量（与 AWS 文档一致；未列出类型走启发式）
+_GPU_PER_INSTANCE: dict[str, int] = {
+    "ml.g4dn.xlarge": 1,
+    "ml.g4dn.2xlarge": 1,
+    "ml.g4dn.4xlarge": 1,
+    "ml.g4dn.8xlarge": 1,
+    "ml.g4dn.12xlarge": 4,
+    "ml.g4dn.16xlarge": 1,
+    "ml.g5.xlarge": 1,
+    "ml.g5.2xlarge": 1,
+    "ml.g5.4xlarge": 1,
+    "ml.g5.8xlarge": 1,
+    "ml.g5.12xlarge": 4,
+    "ml.g5.16xlarge": 1,
+    "ml.g5.24xlarge": 4,
+    "ml.g5.48xlarge": 8,
+    "ml.p3.2xlarge": 1,
+    "ml.p3.8xlarge": 4,
+    "ml.p3.16xlarge": 8,
+    "ml.p4d.24xlarge": 8,
+    "ml.p4de.24xlarge": 8,
+    "ml.m5.large": 0,
+    "ml.m5.xlarge": 0,
+    "ml.m5.2xlarge": 0,
+    "ml.c5.xlarge": 0,
+}
+
+
+def _gpu_units_for_instance(instance_type: str, instance_count: int) -> int:
+    """估算任务占用的 GPU「张」数（同类型多节点会相乘）。"""
+    t = instance_type.strip()
+    ic = max(instance_count, 1)
+    if t in _GPU_PER_INSTANCE:
+        return _GPU_PER_INSTANCE[t] * ic
+    tl = t.lower()
+    if any(x in tl for x in ("ml.g4", "ml.g5", "ml.p2", "ml.p3", "ml.p4", "ml.p5")):
+        return ic  # 未收录的 GPU 族：保守按每节点 1 卡
+    return 0
+
+
+def _describe_job_instance(job_name: str) -> tuple[str, int]:
+    r = sm_client.describe_training_job(TrainingJobName=job_name)
+    rc = r.get("ResourceConfig") or {}
+    it = str(rc.get("InstanceType", "unknown"))
+    ic = int(rc.get("InstanceCount") or 1)
+    return it, max(ic, 1)
+
+
+def _enrich_jobs_with_resources(jobs: list[dict]) -> list[dict]:
+    """为每个任务补充实例类型、节点数、GPU 估算（依赖 DescribeTrainingJob）。"""
+    out: list[dict] = []
+    for j in jobs:
+        name = j["job_name"]
+        try:
+            it, ic = _describe_job_instance(name)
+            gpu = _gpu_units_for_instance(it, ic)
+        except Exception:
+            it, ic, gpu = "unknown", 1, 0
+        row = {**j, "instance_type": it, "instance_count": ic, "gpu_units": gpu}
+        out.append(row)
+    return out
+
+
+def _aggregate_pool_stats(enriched: list[dict]) -> tuple[int, int]:
+    """返回 (训练实例节点总数, GPU 张数估算总和)。"""
+    nodes = sum(int(j.get("instance_count", 1)) for j in enriched)
+    gpus = sum(int(j.get("gpu_units", 0)) for j in enriched)
+    return nodes, gpus
 
 
 # ================= 调度与查询 =================
@@ -156,26 +311,41 @@ async def stop_job(job_name: str):
 
 @app.get("/admin/active-jobs", summary="列出进行中的训练任务")
 async def list_active_jobs():
-    """查看当前账户下状态为 InProgress 的训练任务（便于盯计费）。"""
+    """查看当前账户下状态为 InProgress 的训练任务（便于盯计费）。自动翻页，含实例与 GPU 估算。"""
     try:
-        response = sm_client.list_training_jobs(
-            StatusEquals="InProgress",
-            SortBy="CreationTime",
-            SortOrder="Descending",
-            MaxResults=50,
-        )
-        summaries = response.get("TrainingJobSummaries", [])
-        jobs = [
-            {
-                "job_name": j["TrainingJobName"],
-                "creation_time": j["CreationTime"].isoformat(),
-            }
-            for j in summaries
-        ]
+        jobs = _enrich_jobs_with_resources(_list_in_progress_jobs())
+        nodes, gpus = _aggregate_pool_stats(jobs)
         return {
             "active_count": len(jobs),
+            "total_training_instances": nodes,
+            "total_gpu_units": gpus,
             "jobs": jobs,
-            "next_token": response.get("NextToken"),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/admin/stats", summary="获取全局大盘数据")
+async def admin_stats():
+    """进行中任务、池内节点/GPU 估算、当日 UTC 新建任务数、任务明细。"""
+    try:
+        raw = _list_in_progress_jobs()
+        jobs = _enrich_jobs_with_resources(raw)
+        nodes, gpus = _aggregate_pool_stats(jobs)
+        now = datetime.now(timezone.utc)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_created = _count_jobs_created_since(day_start)
+        return {
+            "active_count": len(jobs),
+            "total_training_instances": nodes,
+            "total_gpu_units": gpus,
+            "jobs_created_today_utc": today_created,
+            "jobs": jobs,
+            "as_of_utc": now.isoformat(),
+            "resource_note": (
+                "gpu_units 按实例类型映射常见规格估算；未收录的 GPU 族按每节点 1 卡保守估计，"
+                "与 AWS 控制台计费明细可能略有差异。"
+            ),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -218,3 +388,10 @@ async def generate_upload_url(request: UploadRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"生成上传链接失败: {e}") from e
+
+
+# ================= 前端静态资源（npm run build 后由 FastAPI 单端口托管）=================
+
+_frontend_dist = _repo_root / "frontend" / "dist"
+if _frontend_dist.is_dir():
+    app.mount("/", StaticFiles(directory=str(_frontend_dist), html=True), name="spa")
