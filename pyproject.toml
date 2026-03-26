@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-dispatcher-api"
+version = "0.1.0"
+description = "FastAPI gateway for SageMaker GPU training jobs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.23",
+    "boto3>=1.28",
+    "python-dotenv>=1.0.0",
+]
+
+[tool.setuptools]
+py-modules = ["main"]
