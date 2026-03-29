@@ -102,7 +102,9 @@ async def allocate_gpu_instance(req: AllocateRequest):
         if not public_ip:
             raise RuntimeError("未能成功获取公网 IP")
 
-        one_click_command = f"""echo -e "{private_key_pem.replace('"', '\\"')}" > {key_name}.pem && chmod 400 {key_name}.pem && ssh -o StrictHostKeyChecking=no -i {key_name}.pem ubuntu@{public_ip}"""
+        escaped_pem = private_key_pem.replace('"', '\\"')
+        
+        one_click_command = f"""echo -e "{escaped_pem}" > {key_name}.pem && chmod 400 {key_name}.pem && ssh -o ServerAliveInterval=60 -o StrictHostKeyChecking=no -i {key_name}.pem ubuntu@{public_ip}"""
 
         return {
             "status": "success",
