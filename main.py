@@ -177,3 +177,49 @@ async def terminate_instance(instance_id: str):
         raise HTTPException(status_code=500, detail=f"销毁机器失败: {e!s}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"系统内部错误: {e!s}")
+
+# ==========================================
+# 接口 4: 查询所有活跃机器列表 (防漏删、防扣费)
+# ==========================================
+@app.get("/api/v1/instances")
+async def list_active_instances():
+    """查询所有未销毁的机器列表 (排除已彻底 terminated 的废弃记录)"""
+    try:
+        # 只查询非 terminated 的机器 (保留 running, pending, stopped 等状态)
+        filters = [
+            {
+                'Name': 'instance-state-name',
+                'Values': ['pending', 'running', 'stopping', 'stopped', 'shutting-down']
+            }
+        ]
+        instances = ec2_resource.instances.filter(Filters=filters)
+
+        result = []
+        for inst in instances:
+            # 尝试解析我们之前开机时打的标签，揪出是谁开的机器
+            owner = "未知"
+            name = "未命名"
+            if inst.tags:
+                for tag in inst.tags:
+                    if tag['Key'] == 'Owner':
+                        owner = tag['Value']
+                    if tag['Key'] == 'Name':
+                        name = tag['Value']
+
+            result.append({
+                "instance_id": inst.id,
+                "state": inst.state['Name'],
+                "public_ip": inst.public_ip_address,
+                "instance_type": inst.instance_type,
+                "owner": owner,
+                "name": name,
+                "launch_time": str(inst.launch_time) # 启动时间
+            })
+
+        return {
+            "status": "success",
+            "message": f"当前共有 {len(result)} 台活跃机器",
+            "data": result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询机器列表失败: {e!s}")
